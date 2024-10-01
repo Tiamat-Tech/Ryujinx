@@ -1,4 +1,4 @@
-﻿using Ryujinx.Graphics.GAL.Multithreading.Commands.Window;
+using Ryujinx.Graphics.GAL.Multithreading.Commands.Window;
 using Ryujinx.Graphics.GAL.Multithreading.Model;
 using Ryujinx.Graphics.GAL.Multithreading.Resources;
 using System;
@@ -38,5 +38,7 @@ namespace Ryujinx.Graphics.GAL.Multithreading
         public void SetScalingFilter(ScalingFilter type) { }
 
         public void SetScalingFilterLevel(float level) { }
+
+        public void SetColorSpacePassthrough(bool colorSpacePassthroughEnabled) { }
     }
 }

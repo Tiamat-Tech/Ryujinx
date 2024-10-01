@@ -1,4 +1,4 @@
-﻿using Ryujinx.Common.Logging;
+using Ryujinx.Common.Logging;
 using Ryujinx.Graphics.GAL;
 using Ryujinx.Graphics.Gpu.Engine.Threed.Blender;
 using Ryujinx.Graphics.Gpu.Engine.Types;
@@ -17,11 +17,17 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
     class StateUpdater
     {
         public const int ShaderStateIndex = 26;
+        public const int RtColorMaskIndex = 14;
         public const int RasterizerStateIndex = 15;
         public const int ScissorStateIndex = 16;
         public const int VertexBufferStateIndex = 0;
+        public const int BlendStateIndex = 2;
+        public const int IndexBufferStateIndex = 23;
         public const int PrimitiveRestartStateIndex = 12;
         public const int RenderTargetStateIndex = 27;
+
+        // Vertex buffers larger than this size will be clamped to the mapped size.
+        private const ulong VertexBufferSizeToMappedSizeThreshold = 256 * 1024 * 1024; // 256 MB
 
         private readonly GpuContext _context;
         private readonly GpuChannel _channel;
@@ -37,13 +43,15 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
 
         private ProgramPipelineState _pipeline;
 
+        private bool _fsReadsFragCoord;
         private bool _vsUsesDrawParameters;
         private bool _vtgWritesRtLayer;
         private byte _vsClipDistancesWritten;
         private uint _vbEnableMask;
 
         private bool _prevDrawIndexed;
-        private readonly bool _prevDrawIndirect;
+        private bool _prevDrawIndirect;
+        private bool _prevDrawUsesEngineState;
         private IndexType _prevIndexType;
         private uint _prevFirstVertex;
         private bool _prevTfEnable;
@@ -232,7 +240,9 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
             // method when doing indexed draws, so we need to make sure
             // to update the vertex buffers if we are doing a regular
             // draw after a indexed one and vice-versa.
-            if (_drawState.DrawIndexed != _prevDrawIndexed)
+            // Some draws also do not update the engine state, so it is possible for it
+            // to not be dirty even if the vertex counts or other state changed. We need to force it to be dirty in this case.
+            if (_drawState.DrawIndexed != _prevDrawIndexed || _drawState.DrawUsesEngineState != _prevDrawUsesEngineState)
             {
                 _updateTracker.ForceDirty(VertexBufferStateIndex);
 
@@ -247,6 +257,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                 }
 
                 _prevDrawIndexed = _drawState.DrawIndexed;
+                _prevDrawUsesEngineState = _drawState.DrawUsesEngineState;
             }
 
             // Some draw parameters are used to restrict the vertex buffer size,
@@ -256,6 +267,8 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
             if (_drawState.DrawIndirect != _prevDrawIndirect)
             {
                 _updateTracker.ForceDirty(VertexBufferStateIndex);
+
+                _prevDrawIndirect = _drawState.DrawIndirect;
             }
 
             // In some cases, the index type is also used to guess the
@@ -289,7 +302,13 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
             // of the shader for the new state.
             if (_shaderSpecState != null && _currentSpecState.HasChanged())
             {
-                if (!_shaderSpecState.MatchesGraphics(_channel, ref _currentSpecState.GetPoolState(), ref _currentSpecState.GetGraphicsState(), _vsUsesDrawParameters, false))
+                if (!_shaderSpecState.MatchesGraphics(
+                    _channel,
+                    ref _currentSpecState.GetPoolState(),
+                    ref _currentSpecState.GetGraphicsState(),
+                    _drawState.VertexAsCompute != null,
+                    _vsUsesDrawParameters,
+                    checkTextures: false))
                 {
                     // Shader must be reloaded. _vtgWritesRtLayer should not change.
                     UpdateShaderState();
@@ -324,13 +343,24 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
 
             bool unalignedChanged = _currentSpecState.SetHasUnalignedStorageBuffer(_channel.BufferManager.HasUnalignedStorageBuffers);
 
-            if (!_channel.TextureManager.CommitGraphicsBindings(_shaderSpecState) || unalignedChanged)
+            bool scaleMismatch;
+            do
             {
-                // Shader must be reloaded. _vtgWritesRtLayer should not change.
-                UpdateShaderState();
-            }
+                if (!_channel.TextureManager.CommitGraphicsBindings(_shaderSpecState, out scaleMismatch) || unalignedChanged)
+                {
+                    // Shader must be reloaded. _vtgWritesRtLayer should not change.
+                    UpdateShaderState();
+                }
 
-            _channel.BufferManager.CommitGraphicsBindings();
+                if (scaleMismatch)
+                {
+                    // Binding textures changed scale of the bound render targets, correct the render target scale and rebind.
+                    UpdateRenderTargetState();
+                }
+            }
+            while (scaleMismatch);
+
+            _channel.BufferManager.CommitGraphicsBindings(_drawState.DrawIndexed);
         }
 
         /// <summary>
@@ -439,6 +469,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
             bool useControl = updateFlags.HasFlag(RenderTargetUpdateFlags.UseControl);
             bool layered = updateFlags.HasFlag(RenderTargetUpdateFlags.Layered);
             bool singleColor = updateFlags.HasFlag(RenderTargetUpdateFlags.SingleColor);
+            bool discard = updateFlags.HasFlag(RenderTargetUpdateFlags.DiscardClip);
 
             int count = useControl ? rtControl.UnpackCount() : Constants.TotalRenderTargets;
 
@@ -478,6 +509,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                     memoryManager,
                     colorState,
                     _vtgWritesRtLayer || layered,
+                    discard,
                     samplesInX,
                     samplesInY,
                     sizeHint);
@@ -517,6 +549,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                     dsState,
                     dsSize,
                     _vtgWritesRtLayer || layered,
+                    discard,
                     samplesInX,
                     samplesInY,
                     sizeHint);
@@ -692,11 +725,10 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
             var face = _state.State.FaceState;
 
             bool disableTransform = _state.State.ViewportTransformEnable == 0;
+            bool yNegate = yControl.HasFlag(YControl.NegateY);
 
             UpdateFrontFace(yControl, face.FrontFace);
             UpdateDepthMode();
-
-            bool flipY = yControl.HasFlag(YControl.NegateY);
 
             Span<Viewport> viewports = stackalloc Viewport[Constants.TotalViewports];
 
@@ -719,7 +751,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                 float scaleX = MathF.Abs(transform.ScaleX);
                 float scaleY = transform.ScaleY;
 
-                if (flipY)
+                if (yNegate)
                 {
                     scaleY = -scaleY;
                 }
@@ -771,8 +803,17 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                 _channel.TextureManager.RenderTargetScale,
                 disableTransform);
 
+            // Viewport size is only used on the shader when YNegate is enabled,
+            // and if the fragment shader accesses gl_FragCoord,
+            // so there's no need to update it in other cases.
+            if (yNegate && _fsReadsFragCoord)
+            {
+                UpdateSupportBufferViewportSize();
+            }
+
             _currentSpecState.SetViewportTransformDisable(disableTransform);
             _currentSpecState.SetDepthMode(GetDepthMode() == DepthMode.MinusOneToOne);
+            _currentSpecState.SetYNegateEnabled(yNegate);
         }
 
         /// <summary>
@@ -923,6 +964,7 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
         /// </summary>
         private void UpdateVertexAttribState()
         {
+            bool supportsScaledFormats = _context.Capabilities.SupportsScaledVertexFormats;
             uint vbEnableMask = _vbEnableMask;
 
             Span<VertexAttribDescriptor> vertexAttribs = stackalloc VertexAttribDescriptor[Constants.TotalVertexAttribs];
@@ -940,7 +982,19 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                     continue;
                 }
 
-                if (!FormatTable.TryGetAttribFormat(vertexAttrib.UnpackFormat(), out Format format))
+                uint packedFormat = vertexAttrib.UnpackFormat();
+
+                if (!supportsScaledFormats)
+                {
+                    packedFormat = vertexAttrib.UnpackType() switch
+                    {
+                        VertexAttribType.Uscaled => ((uint)VertexAttribType.Uint << 27) | (packedFormat & (0x3f << 21)),
+                        VertexAttribType.Sscaled => ((uint)VertexAttribType.Sint << 27) | (packedFormat & (0x3f << 21)),
+                        _ => packedFormat,
+                    };
+                }
+
+                if (!FormatTable.TryGetAttribFormat(packedFormat, out Format format))
                 {
                     Logger.Debug?.Print(LogClass.Gpu, $"Invalid attribute format 0x{vertexAttrib.UnpackFormat():X}.");
 
@@ -1103,6 +1157,14 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                         maxVertexBufferSize *= (uint)stride;
 
                         size = Math.Min(size, maxVertexBufferSize);
+                    }
+                    else if (size > VertexBufferSizeToMappedSizeThreshold)
+                    {
+                        // Make sure we have a sane vertex buffer size, since in some cases applications
+                        // might set the "end address" of the vertex buffer to the end of the GPU address space,
+                        // which would result in a several GBs large buffer.
+
+                        size = _channel.MemoryManager.GetMappedSize(address, size);
                     }
                 }
                 else
@@ -1367,7 +1429,18 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                 addressesSpan[index] = baseAddress + shader.Offset;
             }
 
-            CachedShaderProgram gs = shaderCache.GetGraphicsShader(ref _state.State, ref _pipeline, _channel, ref _currentSpecState.GetPoolState(), ref _currentSpecState.GetGraphicsState(), addresses);
+            int samplerPoolMaximumId = _state.State.SamplerIndex == SamplerIndex.ViaHeaderIndex
+                ? _state.State.TexturePoolState.MaximumId
+                : _state.State.SamplerPoolState.MaximumId;
+
+            CachedShaderProgram gs = shaderCache.GetGraphicsShader(
+                ref _state.State,
+                ref _pipeline,
+                _channel,
+                samplerPoolMaximumId,
+                ref _currentSpecState.GetPoolState(),
+                ref _currentSpecState.GetGraphicsState(),
+                addresses);
 
             // Consume the modified flag for spec state so that it isn't checked again.
             _currentSpecState.SetShader(gs);
@@ -1415,7 +1488,52 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
                 _currentProgramInfo[stageIndex] = info;
             }
 
+            if (gs.Shaders[5]?.Info.UsesFragCoord == true)
+            {
+                // Make sure we update the viewport size on the support buffer if it will be consumed on the new shader.
+
+                if (!_fsReadsFragCoord && _state.State.YControl.HasFlag(YControl.NegateY))
+                {
+                    UpdateSupportBufferViewportSize();
+                }
+
+                _fsReadsFragCoord = true;
+            }
+            else
+            {
+                _fsReadsFragCoord = false;
+            }
+
+            if (gs.VertexAsCompute != null)
+            {
+                _drawState.VertexAsCompute = gs.VertexAsCompute;
+                _drawState.GeometryAsCompute = gs.GeometryAsCompute;
+                _drawState.VertexPassthrough = gs.HostProgram;
+            }
+            else
+            {
+                _drawState.VertexAsCompute = null;
+                _drawState.GeometryAsCompute = null;
+                _drawState.VertexPassthrough = null;
+            }
+
             _context.Renderer.Pipeline.SetProgram(gs.HostProgram);
+        }
+
+        /// <summary>
+        /// Updates the viewport size on the support buffer for fragment shader access.
+        /// </summary>
+        private void UpdateSupportBufferViewportSize()
+        {
+            ref var transform = ref _state.State.ViewportTransform[0];
+
+            float scaleX = MathF.Abs(transform.ScaleX);
+            float scaleY = transform.ScaleY;
+
+            float width = scaleX * 2;
+            float height = scaleY * 2;
+
+            _context.SupportBufferUpdater.SetViewportSize(width, MathF.Abs(height));
         }
 
         /// <summary>
@@ -1485,6 +1603,15 @@ namespace Ryujinx.Graphics.Gpu.Engine.Threed
         public void ForceShaderUpdate()
         {
             _updateTracker.ForceDirty(ShaderStateIndex);
+        }
+
+        /// <summary>
+        /// Forces a register group as dirty, by index.
+        /// </summary>
+        /// <param name="groupIndex">Index of the group to be dirtied</param>
+        public void ForceDirty(int groupIndex)
+        {
+            _updateTracker.ForceDirty(groupIndex);
         }
     }
 }

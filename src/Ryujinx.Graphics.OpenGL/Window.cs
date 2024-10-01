@@ -307,6 +307,8 @@ namespace Ryujinx.Graphics.OpenGL
             _updateScalingFilter = true;
         }
 
+        public void SetColorSpacePassthrough(bool colorSpacePassthroughEnabled) { }
+
         private void UpdateEffect()
         {
             if (_updateEffect)
@@ -370,6 +372,16 @@ namespace Ryujinx.Graphics.OpenGL
                         }
                         _isLinear = false;
                         _scalingFilter.Level = _scalingFilterLevel;
+
+                        RecreateUpscalingTexture();
+                        break;
+                    case ScalingFilter.Area:
+                        if (_scalingFilter is not AreaScalingFilter)
+                        {
+                            _scalingFilter?.Dispose();
+                            _scalingFilter = new AreaScalingFilter(_renderer);
+                        }
+                        _isLinear = false;
 
                         RecreateUpscalingTexture();
                         break;

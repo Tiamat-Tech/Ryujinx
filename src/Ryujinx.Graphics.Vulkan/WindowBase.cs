@@ -1,4 +1,4 @@
-﻿using Ryujinx.Graphics.GAL;
+using Ryujinx.Graphics.GAL;
 using System;
 
 namespace Ryujinx.Graphics.Vulkan
@@ -14,5 +14,6 @@ namespace Ryujinx.Graphics.Vulkan
         public abstract void SetAntiAliasing(AntiAliasing effect);
         public abstract void SetScalingFilter(ScalingFilter scalerType);
         public abstract void SetScalingFilterLevel(float scale);
+        public abstract void SetColorSpacePassthrough(bool colorSpacePassthroughEnabled);
     }
 }
